@@ -32,24 +32,25 @@ export default async function handler(req, res) {
     return res.status(200).json({ ok: true, ignored: true });
   }
 
-  // Acknowledge Telegram quickly
-  res.status(200).json({ ok: true });
-
   try {
-    await connectMongo();
+    if (CONFIG.MONGODB_URI) {
+      await connectMongo();
+    }
 
     // 1. Handle Callback Queries (Buttons)
     if (update.callback_query) {
       await handleCallback(update.callback_query);
-      return;
     }
 
     // 2. Handle Messages
     if (update.message) {
       await handleMessage(update.message);
     }
+
+    return res.status(200).json({ ok: true });
   } catch (err) {
     console.error('[Webhook] Unhandled error:', err);
+    return res.status(200).json({ ok: false, error: err.message });
   }
 }
 
