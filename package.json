@@ -1,0 +1,14 @@
+{
+  "name": "terabox-telegram-vercel-bot",
+  "version": "1.0.0",
+  "description": "Serverless Telegram Bot for TeraBox direct download and stream links on Vercel",
+  "main": "api/webhook.js",
+  "type": "module",
+  "scripts": {
+    "start": "node api/webhook.js"
+  },
+  "dependencies": {
+    "mongoose": "^9.9.1"
+  }
+}
+
