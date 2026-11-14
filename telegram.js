@@ -87,6 +87,36 @@ export async function isTokenSystemEnabled() {
 }
 
 /**
+ * Check if admin bypass for Force Sub is enabled (Default false)
+ */
+export async function isAdminBypassEnabled() {
+  try {
+    const setting = await BotSetting.findOne({ key: 'ADMIN_BYPASS_FORCESUB' });
+    if (setting && typeof setting.value === 'boolean') {
+      return setting.value;
+    }
+  } catch (e) {
+    console.error('[Settings] Error checking ADMIN_BYPASS_FORCESUB:', e.message);
+  }
+  return false;
+}
+
+/**
+ * Retrieve current Dump Channel ID from DB (BotSetting) or config
+ */
+export async function getDumpChannelId() {
+  try {
+    const setting = await BotSetting.findOne({ key: 'DUMP_CHANNEL_ID' });
+    if (setting && setting.value) {
+      return Number(setting.value);
+    }
+  } catch (e) {
+    console.error('[Settings] Error reading DUMP_CHANNEL_ID:', e.message);
+  }
+  return CONFIG.DUMP_CHANNEL_ID ? Number(CONFIG.DUMP_CHANNEL_ID) : null;
+}
+
+/**
  * Retrieve active Force Sub channels from MongoDB (with auto-seeding if empty)
  */
 export async function getActiveForceSubChannels() {
@@ -125,10 +155,13 @@ export async function getActiveForceSubChannels() {
  * Supports both direct membership and pending Join Requests (for private links)
  */
 export async function isUserInChat(chatId, userId) {
+  const numChatId = Number(chatId);
+  const numUserId = Number(userId);
+
   try {
     const res = await tgCall('getChatMember', {
-      chat_id: chatId,
-      user_id: userId,
+      chat_id: numChatId,
+      user_id: numUserId,
     });
     if (res.ok && res.result) {
       const status = res.result.status;
@@ -137,15 +170,15 @@ export async function isUserInChat(chatId, userId) {
       }
     }
   } catch (err) {
-    console.error(`[ForceSub] getChatMember error chat ${chatId}:`, err.message);
+    console.error(`[ForceSub] getChatMember error chat ${numChatId}:`, err.message);
   }
 
-  // Check pending join request in MongoDB (for private channels with Request to Join)
+  // Check pending or approved join request in MongoDB (for private channels with Request to Join)
   try {
     const req = await JoinRequest.findOne({
-      userId: Number(userId),
-      chatId: Number(chatId),
-      status: 'pending',
+      userId: { $in: [numUserId, String(numUserId)] },
+      chatId: { $in: [numChatId, String(numChatId)] },
+      status: { $in: ['pending', 'approved'] },
     });
     if (req) {
       return true;
@@ -164,7 +197,12 @@ export async function isUserInChat(chatId, userId) {
  */
 export async function checkForceSub(userId, ignoreAdmin = false) {
   const enabled = await isForceSubEnabled();
-  if (!enabled || (!ignoreAdmin && CONFIG.ADMINS.includes(userId))) {
+  if (!enabled) {
+    return { joined: true, channels: [] };
+  }
+
+  const adminBypass = await isAdminBypassEnabled();
+  if (adminBypass && !ignoreAdmin && CONFIG.ADMINS.includes(Number(userId))) {
     return { joined: true };
   }
 
@@ -191,7 +229,7 @@ export async function checkForceSub(userId, ignoreAdmin = false) {
 /**
  * Build inline keyboard for Force Sub channels dynamically
  */
-export function buildForceSubKeyboard(channels = []) {
+export function buildForceSubKeyboard(channels = [], showVerify = true) {
   const keyboard = [];
   for (let i = 0; i < channels.length; i += 2) {
     const row = [
@@ -205,7 +243,59 @@ export function buildForceSubKeyboard(channels = []) {
   if (CONFIG.UPDATE_CHANNEL_URL) {
     keyboard.push([{ text: 'Updates Channel 📢', url: CONFIG.UPDATE_CHANNEL_URL }]);
   }
+  if (showVerify) {
+    keyboard.push([{ text: '🔄 Verify / I Have Joined', callback_data: 'forcesub_check' }]);
+  }
   return { inline_keyboard: keyboard };
+}
+
+/**
+ * Send parsed file details and stream/download links to the configured Dump Channel
+ */
+export async function sendToDumpChannel({ file, user, originalUrl, downloadLink, streamLink }) {
+  const dumpChatId = await getDumpChannelId();
+  if (!dumpChatId) return null;
+
+  const fileName = file.name || 'TeraBox_File';
+  const fileSize = file.size || 'Unknown';
+  const userMention = user.username
+    ? `@${user.username}`
+    : `[${user.firstName || 'User'}](tg://user?id=${user.id})`;
+
+  const caption =
+    `📦 *TeraBox File Dump*\n\n` +
+    `📁 *File Name:* \`${fileName}\`\n` +
+    `💾 *Size:* \`${fileSize}\`\n` +
+    `👤 *Requested By:* ${userMention} (\`${user.id}\`)\n` +
+    `🔗 *Original Link:* ${originalUrl}\n` +
+    `⏰ *Time:* \`${new Date().toUTCString()}\``;
+
+  const buttons = [
+    [{ text: '⬇️ Direct Download', url: downloadLink }],
+    [{ text: '▶️ Watch / Stream Online', url: streamLink }],
+  ];
+
+  try {
+    if (file.thumbnail && file.thumbnail.startsWith('http')) {
+      return await tgCall('sendPhoto', {
+        chat_id: dumpChatId,
+        photo: file.thumbnail,
+        caption,
+        parse_mode: 'Markdown',
+        reply_markup: { inline_keyboard: buttons },
+      });
+    } else {
+      return await tgCall('sendMessage', {
+        chat_id: dumpChatId,
+        text: caption,
+        parse_mode: 'Markdown',
+        reply_markup: { inline_keyboard: buttons },
+      });
+    }
+  } catch (err) {
+    console.error(`[DumpChannel] Failed to post to ${dumpChatId}:`, err.message);
+    return null;
+  }
 }
 
 /**

@@ -28,6 +28,9 @@ export const CONFIG = {
   ].filter((ch) => ch.id !== 0 && ch.url),
   UPDATE_CHANNEL_URL: process.env.UPDATE_CHANNEL_URL || "https://t.me/TeraboxDownloaderINDIA",
 
+  // Dump Channel (Where parsed files & download links are archived)
+  DUMP_CHANNEL_ID: process.env.DUMP_CHANNEL_ID || "-1004161131573",
+
   // Download & Stream Proxy
   DOWNLOAD_PROXY_URL: process.env.DOWNLOAD_PROXY_URL || "https://teraboxdownloader.co.in/download.php",
 

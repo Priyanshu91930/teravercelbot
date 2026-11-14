@@ -16,6 +16,9 @@ import {
   getActiveForceSubChannels,
   isForceSubEnabled,
   isTokenSystemEnabled,
+  isAdminBypassEnabled,
+  getDumpChannelId,
+  sendToDumpChannel,
   buildForceSubKeyboard,
 } from '../telegram.js';
 
@@ -30,7 +33,7 @@ export default async function handler(req, res) {
     if (setup === '1' && url) {
       const setRes = await tgCall('setWebhook', {
         url,
-        allowed_updates: ['message', 'callback_query', 'chat_join_request'],
+        allowed_updates: ['message', 'callback_query', 'chat_join_request', 'chat_member'],
       });
       return res.status(200).json({ status: 'Webhook setup requested', result: setRes });
     }
@@ -55,6 +58,12 @@ export default async function handler(req, res) {
     // 0. Handle Chat Join Requests (for private channel auto-verification)
     if (update.chat_join_request) {
       await handleJoinRequest(update.chat_join_request);
+      return res.status(200).json({ ok: true });
+    }
+
+    // 0.1 Handle Chat Member Updates (if user leaves, revoke pending request)
+    if (update.chat_member) {
+      await handleChatMember(update.chat_member);
       return res.status(200).json({ ok: true });
     }
 
@@ -98,6 +107,36 @@ async function handleJoinRequest(cjr) {
 }
 
 /**
+ * Handle Telegram Chat Member updates (user joins, leaves or is banned)
+ */
+async function handleChatMember(cm) {
+  try {
+    const userId = cm.user?.id || cm.from?.id;
+    const chatId = cm.chat?.id;
+    const newStatus = cm.new_chat_member?.status;
+    if (!userId || !chatId) return;
+
+    const numUserId = Number(userId);
+    const numChatId = Number(chatId);
+
+    if (['left', 'kicked'].includes(newStatus)) {
+      await JoinRequest.deleteMany({
+        userId: { $in: [numUserId, String(numUserId)] },
+        chatId: { $in: [numChatId, String(numChatId)] },
+      });
+      console.log(`[ChatMember] User ${numUserId} left or kicked from chat ${numChatId}, removed JoinRequest`);
+    } else if (['member', 'administrator', 'creator'].includes(newStatus)) {
+      await JoinRequest.updateOne(
+        { userId: numUserId, chatId: numChatId },
+        { $set: { status: 'approved' } }
+      );
+    }
+  } catch (e) {
+    console.error('[ChatMember] Error processing chat_member update:', e.message);
+  }
+}
+
+/**
  * Handle incoming Telegram messages
  */
 async function handleMessage(m) {
@@ -135,6 +174,10 @@ async function handleMessage(m) {
 
       if (adminState.state === 'AWAITING_INVITE_LINK') {
         return await handleCustomInviteLink(m, adminState);
+      }
+
+      if (adminState.state === 'AWAITING_DUMP_FORWARD') {
+        return await handleForwardedDumpChannel(m, adminState);
       }
     }
   }
@@ -216,10 +259,52 @@ async function handleMessage(m) {
     }
   }
 
+  // Command: /setdump (Admins only)
+  if (text.startsWith('/setdump')) {
+    if (!isAdmin) {
+      return await tgCall('sendMessage', {
+        chat_id: chatId,
+        text: '❌ *Access Denied:* Admin command only.',
+        parse_mode: 'Markdown',
+      });
+    }
+
+    const parts = text.split(' ');
+    const targetChat = parts[1]?.trim();
+
+    if (targetChat) {
+      const channelId = Number(targetChat);
+      if (isNaN(channelId)) {
+        return await tgCall('sendMessage', {
+          chat_id: chatId,
+          text: '❌ Invalid channel ID format. Must be numeric (e.g. `-100xxxxxxxxxx`).',
+          parse_mode: 'Markdown',
+        });
+      }
+      return await applyDumpChannel(chatId, channelId, 'Dump Channel 📢', userId);
+    }
+
+    // Set admin state to wait for forwarded message
+    await AdminState.updateOne(
+      { user_id: userId },
+      { $set: { state: 'AWAITING_DUMP_FORWARD', data: {}, updated_at: new Date() } },
+      { upsert: true }
+    );
+
+    return await tgCall('sendMessage', {
+      chat_id: chatId,
+      text: `📢 *Set Dump Channel*\n\n👉 *Please forward any message from your Dump Channel* (\`https://t.me/+hbVmKnNuuwFlMGQ1\`) to this chat.\n\n⚠️ *Important:* Ensure @${CONFIG.BOT_USERNAME || 'the bot'} is added as an *Administrator* with "Post Messages" permission in that channel!\n\nOr send \`/setdump <channel_id>\`, or send /cancel to abort.`,
+      parse_mode: 'Markdown',
+      reply_markup: {
+        inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'settings_home' }]],
+      },
+    });
+  }
+
   // Check if message contains a TeraBox link
   const teraboxUrl = extractTeraboxUrl(text);
   if (teraboxUrl) {
-    return await handleTeraboxLink(chatId, userId, teraboxUrl, m.message_id);
+    return await handleTeraboxLink(chatId, userId, teraboxUrl, m.message_id, { username, firstName });
   }
 }
 
@@ -370,11 +455,79 @@ async function handleCustomInviteLink(m, adminState) {
 }
 
 /**
+ * Handle admin forwarding a message from the dump channel to configure it
+ */
+async function handleForwardedDumpChannel(m, adminState) {
+  const chatId = m.chat.id;
+  const userId = m.from.id;
+
+  const fwdChat = m.forward_from_chat || m.forward_origin?.chat;
+  if (!fwdChat) {
+    return await tgCall('sendMessage', {
+      chat_id: chatId,
+      text: '⚠️ *That was not a forwarded message from a channel!*\n\nPlease forward any message directly from the target Dump Channel, or send /cancel to abort.',
+      parse_mode: 'Markdown',
+    });
+  }
+
+  const channelId = Number(fwdChat.id);
+  const channelTitle = fwdChat.title || 'Dump Channel 📢';
+  return await applyDumpChannel(chatId, channelId, channelTitle, userId);
+}
+
+/**
+ * Validate and save Dump Channel
+ */
+async function applyDumpChannel(chatId, channelId, channelTitle, userId = null) {
+  // Test if bot can post to that channel
+  const testRes = await tgCall('sendMessage', {
+    chat_id: channelId,
+    text: `🚀 *Dump Channel Connected!*\n\nTeraBox Vercel Bot will automatically dump all parsed files and download links here.`,
+    parse_mode: 'Markdown',
+  });
+
+  if (!testRes.ok) {
+    return await tgCall('sendMessage', {
+      chat_id: chatId,
+      text: `⚠️ *Cannot post to that channel!*\n\n• *Channel:* *${channelTitle}*\n• *ID:* \`${channelId}\`\n• *Error:* \`${testRes.description || 'Forbidden/Not admin'}\`\n\n👉 *Please make sure @${CONFIG.BOT_USERNAME || 'the bot'} is an Administrator in that channel with "Post Messages" rights!*`,
+      parse_mode: 'Markdown',
+    });
+  }
+
+  await BotSetting.updateOne(
+    { key: 'DUMP_CHANNEL_ID' },
+    { $set: { key: 'DUMP_CHANNEL_ID', value: channelId, updated_at: new Date() } },
+    { upsert: true }
+  );
+
+  if (userId) {
+    await AdminState.deleteOne({ user_id: userId });
+  }
+
+  await tgCall('sendMessage', {
+    chat_id: chatId,
+    text: `✅ *Dump Channel Configured Successfully!*\n\n• *Name:* *${channelTitle}*\n• *ID:* \`${channelId}\`\n\nAll downloaded TeraBox files and stream links will now be dumped to this channel! 🚀`,
+    parse_mode: 'Markdown',
+  });
+
+  const panel = await getSettingsPanelData();
+  return await tgCall('sendMessage', {
+    chat_id: chatId,
+    text: panel.text,
+    parse_mode: 'Markdown',
+    disable_web_page_preview: true,
+    reply_markup: panel.reply_markup,
+  });
+}
+
+/**
  * Generate Settings Panel text and buttons
  */
 async function getSettingsPanelData() {
   const forceSubOn = await isForceSubEnabled();
   const tokenOn = await isTokenSystemEnabled();
+  const adminBypassOn = await isAdminBypassEnabled();
+  const dumpChannelId = await getDumpChannelId();
   const channels = await getActiveForceSubChannels();
 
   let channelListText = '';
@@ -388,10 +541,12 @@ async function getSettingsPanelData() {
 
   const text = `⚙️ *Bot Admin Settings Panel*\n\n` +
     `• *Force Subscription:* ${forceSubOn ? '✅ Enabled' : '❌ Disabled'}\n` +
+    `• *Admin ForceSub Bypass:* ${adminBypassOn ? '✅ ON (Admins skip)' : '❌ OFF (Admins checked)'}\n` +
     `• *Token System (/gen):* ${tokenOn ? '✅ Enabled' : '❌ Disabled'}\n` +
+    `• *Dump Channel:* ${dumpChannelId ? `\`${dumpChannelId}\`` : '❌ Not Set'}\n` +
     `• *Active Channels:* \`${channels.length}\`\n\n` +
     `📢 *Current Force Sub Channels:*\n${channelListText}\n\n` +
-    `_Use the buttons below to add or remove channels, or toggle features:_`;
+    `_Use the buttons below to configure channels, settings, and dumps:_`;
 
   const buttons = [
     [
@@ -401,6 +556,10 @@ async function getSettingsPanelData() {
     [
       { text: `Force Sub: ${forceSubOn ? '✅ ON' : '❌ OFF'}`, callback_data: 'toggle_forcesub' },
       { text: `Token System: ${tokenOn ? '✅ ON' : '❌ OFF'}`, callback_data: 'toggle_token' },
+    ],
+    [
+      { text: `Admin Bypass: ${adminBypassOn ? '✅ ON' : '❌ OFF'}`, callback_data: 'toggle_admin_bypass' },
+      { text: '📢 Set Dump Channel', callback_data: 'settings_set_dump' },
     ],
     [
       { text: '🧪 Test Force Sub On Myself', callback_data: 'test_forcesub' },
@@ -539,7 +698,7 @@ async function handleTokenActivation(chatId, userId, tokenId) {
 /**
  * Handle TeraBox URL resolution and reply with Stream & Download buttons
  */
-async function handleTeraboxLink(chatId, userId, url, replyToId) {
+async function handleTeraboxLink(chatId, userId, url, replyToId, userInfo = {}) {
   // 1. Force Sub Check
   const subCheck = await checkForceSub(userId);
   if (!subCheck.joined) {
@@ -660,6 +819,15 @@ async function handleTeraboxLink(chatId, userId, url, replyToId) {
           reply_markup: { inline_keyboard: buttons },
         });
       }
+
+      // Archive link & details to Dump Channel in background
+      sendToDumpChannel({
+        file,
+        user: { id: userId, username: userInfo.username, firstName: userInfo.firstName },
+        originalUrl: url,
+        downloadLink,
+        streamLink,
+      }).catch((e) => console.error('[Dump] Error sending to dump channel:', e.message));
     }
 
     // Delete initial status message
@@ -689,6 +857,35 @@ async function handleCallback(cq) {
   const messageId = cq.message?.message_id;
   const data = cq.data || '';
   const isAdmin = CONFIG.ADMINS.includes(userId);
+
+  // 0. Force Sub User Verification Button (Available to all users)
+  if (data === 'forcesub_check') {
+    const subCheck = await checkForceSub(userId);
+    if (subCheck.joined) {
+      await tgCall('answerCallbackQuery', {
+        callback_query_id: cqId,
+        text: '✅ Verified! You have joined all channels.',
+      });
+      return await tgCall('editMessageText', {
+        chat_id: chatId,
+        message_id: messageId,
+        text: '✅ *Verification Successful!*\n\n🎉 You have joined all required channels!\n\nNow send any *TeraBox link* to instantly get high-speed download and stream links! 🚀',
+        parse_mode: 'Markdown',
+      });
+    } else {
+      await tgCall('answerCallbackQuery', {
+        callback_query_id: cqId,
+        text: "❌ You haven't joined all channels or sent join request yet! Please join and click Verify again.",
+        show_alert: true,
+      });
+      const keyboard = buildForceSubKeyboard(subCheck.channels || []);
+      return await tgCall('editMessageReplyMarkup', {
+        chat_id: chatId,
+        message_id: messageId,
+        reply_markup: keyboard,
+      });
+    }
+  }
 
   // Settings permission protection
   if (
@@ -867,7 +1064,50 @@ async function handleCallback(cq) {
     });
   }
 
-  // 8. Test Force Sub On Myself (Admin self-test)
+  // 8. Toggle Admin Bypass
+  if (data === 'toggle_admin_bypass') {
+    const current = await isAdminBypassEnabled();
+    const nextVal = !current;
+    await BotSetting.updateOne(
+      { key: 'ADMIN_BYPASS_FORCESUB' },
+      { $set: { key: 'ADMIN_BYPASS_FORCESUB', value: nextVal, updated_at: new Date() } },
+      { upsert: true }
+    );
+    await tgCall('answerCallbackQuery', {
+      callback_query_id: cqId,
+      text: `Admin Bypass is now ${nextVal ? 'ON (Admins skip)' : 'OFF (Admins checked)'}`,
+    });
+    const panel = await getSettingsPanelData();
+    return await tgCall('editMessageText', {
+      chat_id: chatId,
+      message_id: messageId,
+      text: panel.text,
+      parse_mode: 'Markdown',
+      disable_web_page_preview: true,
+      reply_markup: panel.reply_markup,
+    });
+  }
+
+  // 9. Set Dump Channel Menu
+  if (data === 'settings_set_dump') {
+    await AdminState.updateOne(
+      { user_id: userId },
+      { $set: { state: 'AWAITING_DUMP_FORWARD', data: {}, updated_at: new Date() } },
+      { upsert: true }
+    );
+    await tgCall('answerCallbackQuery', { callback_query_id: cqId });
+    return await tgCall('editMessageText', {
+      chat_id: chatId,
+      message_id: messageId,
+      text: `📢 *Set Dump Channel*\n\n👉 *Please forward any message from your Dump Channel* (\`https://t.me/+hbVmKnNuuwFlMGQ1\`) to this chat.\n\n⚠️ *Important:* Make sure @${CONFIG.BOT_USERNAME || 'the bot'} is an *Administrator* in that channel with "Post Messages" permission!\n\nOr send \`/setdump <channel_id>\`, or send /cancel to abort.`,
+      parse_mode: 'Markdown',
+      reply_markup: {
+        inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'settings_home' }]],
+      },
+    });
+  }
+
+  // 10. Test Force Sub On Myself (Admin self-test)
   if (data === 'test_forcesub') {
     await tgCall('answerCallbackQuery', { callback_query_id: cqId, text: 'Testing force sub...' });
     const subCheck = await checkForceSub(userId, true); // ignoreAdmin = true
