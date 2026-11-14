@@ -1,10 +1,22 @@
 import { CONFIG } from '../config.js';
-import { connectMongo, BotUser, BotSession } from '../db.js';
+import {
+  connectMongo,
+  BotUser,
+  BotSession,
+  ForceSubChannel,
+  AdminState,
+  BotSetting,
+  JoinRequest,
+} from '../db.js';
 import {
   tgCall,
   extractTeraboxUrl,
   checkForceSub,
   generateShortlink,
+  getActiveForceSubChannels,
+  isForceSubEnabled,
+  isTokenSystemEnabled,
+  buildForceSubKeyboard,
 } from '../telegram.js';
 
 export const config = {
@@ -16,7 +28,10 @@ export default async function handler(req, res) {
   if (req.method === 'GET') {
     const { setup, url } = req.query;
     if (setup === '1' && url) {
-      const setRes = await tgCall('setWebhook', { url });
+      const setRes = await tgCall('setWebhook', {
+        url,
+        allowed_updates: ['message', 'callback_query', 'chat_join_request'],
+      });
       return res.status(200).json({ status: 'Webhook setup requested', result: setRes });
     }
     const info = await tgCall('getWebhookInfo', {});
@@ -28,7 +43,7 @@ export default async function handler(req, res) {
   }
 
   const update = req.body;
-  if (!update || (!update.message && !update.callback_query)) {
+  if (!update) {
     return res.status(200).json({ ok: true, ignored: true });
   }
 
@@ -37,20 +52,48 @@ export default async function handler(req, res) {
       await connectMongo();
     }
 
+    // 0. Handle Chat Join Requests (for private channel auto-verification)
+    if (update.chat_join_request) {
+      await handleJoinRequest(update.chat_join_request);
+      return res.status(200).json({ ok: true });
+    }
+
     // 1. Handle Callback Queries (Buttons)
     if (update.callback_query) {
       await handleCallback(update.callback_query);
+      return res.status(200).json({ ok: true });
     }
 
     // 2. Handle Messages
     if (update.message) {
       await handleMessage(update.message);
+      return res.status(200).json({ ok: true });
     }
 
     return res.status(200).json({ ok: true });
   } catch (err) {
     console.error('[Webhook] Unhandled error:', err);
     return res.status(200).json({ ok: false, error: err.message });
+  }
+}
+
+/**
+ * Handle Telegram Chat Join Request (User clicked "Request to Join Channel")
+ */
+async function handleJoinRequest(cjr) {
+  try {
+    const userId = cjr.from?.id;
+    const chatId = cjr.chat?.id;
+    if (!userId || !chatId) return;
+
+    await JoinRequest.updateOne(
+      { userId: Number(userId), chatId: Number(chatId) },
+      { $set: { userId: Number(userId), chatId: Number(chatId), status: 'pending', createdAt: new Date() } },
+      { upsert: true }
+    );
+    console.log(`[JoinRequest] Recorded join request for user ${userId} in chat ${chatId}`);
+  } catch (e) {
+    console.error('[JoinRequest] Error saving request to DB:', e.message);
   }
 }
 
@@ -63,6 +106,7 @@ async function handleMessage(m) {
   const text = (m.text || '').trim();
   const firstName = m.from?.first_name || '';
   const username = m.from?.username || '';
+  const isAdmin = CONFIG.ADMINS.includes(userId);
 
   // Save / Update Bot User in DB asynchronously
   if (userId) {
@@ -71,6 +115,59 @@ async function handleMessage(m) {
       { $set: { user_id: userId, first_name: firstName, username: username, updated_at: new Date() } },
       { upsert: true }
     ).catch((e) => console.error('[DB] Save user error:', e.message));
+  }
+
+  // ── ADMIN STATE MACHINE (Adding Channel via Forward or Link) ──
+  if (isAdmin) {
+    const adminState = await AdminState.findOne({ user_id: userId });
+    if (adminState) {
+      if (text === '/cancel') {
+        await AdminState.deleteOne({ user_id: userId });
+        return await tgCall('sendMessage', {
+          chat_id: chatId,
+          text: '✅ Action cancelled. Send /settings to open the panel.',
+        });
+      }
+
+      if (adminState.state === 'AWAITING_FORWARD') {
+        return await handleForwardedChannel(m, adminState);
+      }
+
+      if (adminState.state === 'AWAITING_INVITE_LINK') {
+        return await handleCustomInviteLink(m, adminState);
+      }
+    }
+  }
+
+  // Command: /cancel
+  if (text === '/cancel') {
+    if (isAdmin) {
+      await AdminState.deleteOne({ user_id: userId });
+      return await tgCall('sendMessage', {
+        chat_id: chatId,
+        text: '✅ Action cancelled. Send /settings to open settings.',
+      });
+    }
+  }
+
+  // Command: /settings (Admins only)
+  if (text === '/settings') {
+    if (!isAdmin) {
+      return await tgCall('sendMessage', {
+        chat_id: chatId,
+        text: '❌ *Access Denied:* This command is restricted to bot administrators only.',
+        parse_mode: 'Markdown',
+      });
+    }
+    await AdminState.deleteOne({ user_id: userId });
+    const panel = await getSettingsPanelData();
+    return await tgCall('sendMessage', {
+      chat_id: chatId,
+      text: panel.text,
+      parse_mode: 'Markdown',
+      disable_web_page_preview: true,
+      reply_markup: panel.reply_markup,
+    });
   }
 
   // Command: /start
@@ -97,22 +194,23 @@ async function handleMessage(m) {
   if (text === '/id') {
     return await tgCall('sendMessage', {
       chat_id: chatId,
-      text: `Your Chat ID: \`${chatId}\``,
+      text: `Your Chat ID: \`${chatId}\`\nYour User ID: \`${userId}\``,
       parse_mode: 'Markdown',
     });
   }
 
   // Command: /stats (Admins only)
   if (text === '/stats') {
-    if (CONFIG.ADMINS.includes(userId)) {
+    if (isAdmin) {
       const userCount = await BotUser.countDocuments();
       const activeSessions = await BotSession.countDocuments({
         token_id: 'ACTIVE_WINDOW',
         expires_at: { $gt: new Date() },
       });
+      const channelCount = (await getActiveForceSubChannels()).length;
       return await tgCall('sendMessage', {
         chat_id: chatId,
-        text: `📊 *Bot Statistics (Vercel Serverless)*\n\n• *Total Users:* \`${userCount}\`\n• *Active Token Sessions:* \`${activeSessions}\`\n• *API Base:* \`${CONFIG.TERABOX_API_BASE}\``,
+        text: `📊 *Bot Statistics (Vercel Serverless)*\n\n• *Total Users:* \`${userCount}\`\n• *Active Token Sessions:* \`${activeSessions}\`\n• *Force Sub Channels:* \`${channelCount}\`\n• *API Base:* \`${CONFIG.TERABOX_API_BASE}\``,
         parse_mode: 'Markdown',
       });
     }
@@ -126,6 +224,194 @@ async function handleMessage(m) {
 }
 
 /**
+ * Handle admin forwarding a message from the channel to add it
+ */
+async function handleForwardedChannel(m, adminState) {
+  const chatId = m.chat.id;
+  const userId = m.from.id;
+
+  // Telegram forwarded messages can come in forward_from_chat or forward_origin.chat
+  const fwdChat = m.forward_from_chat || m.forward_origin?.chat;
+
+  if (!fwdChat) {
+    return await tgCall('sendMessage', {
+      chat_id: chatId,
+      text: '⚠️ *That was not a forwarded message from a channel or group!*\n\nPlease forward any message directly from the target channel, or send /cancel to abort.',
+      parse_mode: 'Markdown',
+    });
+  }
+
+  const channelId = Number(fwdChat.id);
+  const channelTitle = fwdChat.title || 'Channel 📢';
+
+  // 1. Verify that the bot is an Administrator in that channel
+  const meRes = await tgCall('getMe', {});
+  const botId = meRes?.result?.id;
+
+  if (botId) {
+    const memberRes = await tgCall('getChatMember', {
+      chat_id: channelId,
+      user_id: botId,
+    });
+
+    if (!memberRes.ok || !['administrator', 'creator'].includes(memberRes.result?.status)) {
+      return await tgCall('sendMessage', {
+        chat_id: chatId,
+        text: `⚠️ *Bot is not an administrator in that channel!*\n\n• *Channel:* *${channelTitle}*\n• *ID:* \`${channelId}\`\n\n👉 *Please promote @${CONFIG.BOT_USERNAME || 'the bot'} as an Admin in "${channelTitle}" with "Invite Users" rights*, and then forward the message again.\n\nSend /cancel to abort.`,
+        parse_mode: 'Markdown',
+      });
+    }
+  }
+
+  // 2. Try to obtain invite link automatically
+  let inviteUrl = '';
+  if (fwdChat.username) {
+    inviteUrl = `https://t.me/${fwdChat.username}`;
+  } else {
+    const invRes = await tgCall('exportChatInviteLink', { chat_id: channelId });
+    if (invRes.ok && invRes.result) {
+      inviteUrl = invRes.result;
+    }
+  }
+
+  if (inviteUrl) {
+    // Save channel directly in MongoDB
+    await ForceSubChannel.updateOne(
+      { chat_id: channelId },
+      { $set: { chat_id: channelId, name: channelTitle, url: inviteUrl, created_at: new Date() } },
+      { upsert: true }
+    );
+    await AdminState.deleteOne({ user_id: userId });
+
+    await tgCall('sendMessage', {
+      chat_id: chatId,
+      text: `✅ *Channel Added Successfully!*\n\n• *Name:* *${channelTitle}*\n• *ID:* \`${channelId}\`\n• *Invite Link:* ${inviteUrl}\n\nThis channel is now active in Force Sub!`,
+      parse_mode: 'Markdown',
+      disable_web_page_preview: true,
+    });
+
+    const panel = await getSettingsPanelData();
+    return await tgCall('sendMessage', {
+      chat_id: chatId,
+      text: panel.text,
+      parse_mode: 'Markdown',
+      disable_web_page_preview: true,
+      reply_markup: panel.reply_markup,
+    });
+  }
+
+  // If automatic invite link creation failed, ask admin to paste the invite link
+  await AdminState.updateOne(
+    { user_id: userId },
+    {
+      $set: {
+        state: 'AWAITING_INVITE_LINK',
+        data: { channelId, channelTitle },
+        updated_at: new Date(),
+      },
+    },
+    { upsert: true }
+  );
+
+  return await tgCall('sendMessage', {
+    chat_id: chatId,
+    text: `✅ *Channel Detected!*\n\n• *Name:* *${channelTitle}*\n• *ID:* \`${channelId}\`\n\n🔗 *Now please send the Invite Link for this channel:*\n(e.g. \`https://t.me/+abcd1234...\`)\n\nOr send /cancel to abort.`,
+    parse_mode: 'Markdown',
+  });
+}
+
+/**
+ * Handle admin sending custom invite link
+ */
+async function handleCustomInviteLink(m, adminState) {
+  const chatId = m.chat.id;
+  const userId = m.from.id;
+  const link = (m.text || '').trim();
+
+  if (!link.startsWith('http')) {
+    return await tgCall('sendMessage', {
+      chat_id: chatId,
+      text: '⚠️ Invalid link. Please send a valid Telegram link starting with `https://t.me/...`, or send /cancel to abort.',
+      parse_mode: 'Markdown',
+    });
+  }
+
+  const { channelId, channelTitle } = adminState.data || {};
+  if (!channelId) {
+    await AdminState.deleteOne({ user_id: userId });
+    return await tgCall('sendMessage', {
+      chat_id: chatId,
+      text: '❌ Session expired. Please send /settings and try again.',
+    });
+  }
+
+  await ForceSubChannel.updateOne(
+    { chat_id: channelId },
+    { $set: { chat_id: channelId, name: channelTitle || 'Channel 📢', url: link, created_at: new Date() } },
+    { upsert: true }
+  );
+  await AdminState.deleteOne({ user_id: userId });
+
+  await tgCall('sendMessage', {
+    chat_id: chatId,
+    text: `✅ *Channel Added Successfully!*\n\n• *Name:* *${channelTitle || 'Channel'}*\n• *ID:* \`${channelId}\`\n• *Invite Link:* ${link}\n\nThis channel is now active in Force Sub!`,
+    parse_mode: 'Markdown',
+    disable_web_page_preview: true,
+  });
+
+  const panel = await getSettingsPanelData();
+  return await tgCall('sendMessage', {
+    chat_id: chatId,
+    text: panel.text,
+    parse_mode: 'Markdown',
+    disable_web_page_preview: true,
+    reply_markup: panel.reply_markup,
+  });
+}
+
+/**
+ * Generate Settings Panel text and buttons
+ */
+async function getSettingsPanelData() {
+  const forceSubOn = await isForceSubEnabled();
+  const tokenOn = await isTokenSystemEnabled();
+  const channels = await getActiveForceSubChannels();
+
+  let channelListText = '';
+  if (!channels || channels.length === 0) {
+    channelListText = '_No channels configured yet._';
+  } else {
+    channelListText = channels
+      .map((c, idx) => `${idx + 1}. *${c.name}* (\`${c.id}\`)\n   🔗 [Invite Link](${c.url})`)
+      .join('\n');
+  }
+
+  const text = `⚙️ *Bot Admin Settings Panel*\n\n` +
+    `• *Force Subscription:* ${forceSubOn ? '✅ Enabled' : '❌ Disabled'}\n` +
+    `• *Token System (/gen):* ${tokenOn ? '✅ Enabled' : '❌ Disabled'}\n` +
+    `• *Active Channels:* \`${channels.length}\`\n\n` +
+    `📢 *Current Force Sub Channels:*\n${channelListText}\n\n` +
+    `_Use the buttons below to add or remove channels, or toggle features:_`;
+
+  const buttons = [
+    [
+      { text: '➕ Add Channel', callback_data: 'settings_add_channel' },
+      { text: '🗑️ Delete Channel', callback_data: 'settings_del_menu' },
+    ],
+    [
+      { text: `Force Sub: ${forceSubOn ? '✅ ON' : '❌ OFF'}`, callback_data: 'toggle_forcesub' },
+      { text: `Token System: ${tokenOn ? '✅ ON' : '❌ OFF'}`, callback_data: 'toggle_token' },
+    ],
+    [
+      { text: '🧪 Test Force Sub On Myself', callback_data: 'test_forcesub' },
+      { text: '🔒 Close Panel', callback_data: 'close_settings' },
+    ],
+  ];
+
+  return { text, reply_markup: { inline_keyboard: buttons } };
+}
+
+/**
  * Handle /start command
  */
 async function handleStartCommand(chatId, userId, firstName) {
@@ -134,22 +420,12 @@ async function handleStartCommand(chatId, userId, firstName) {
   const welcomeText = `👋 *Hello ${firstName || 'Friend'}!*\n\nI am your *TeraBox Direct Downloader Bot* powered by fast serverless cloud!\n\nJust send me any *TeraBox link* and I will instantly give you:\n• ⬇️ *Direct High-Speed Download Link*\n• ▶️ *Direct Online Streaming Link*\n\n_No VPS delay, zero wait time!_ 🚀`;
 
   if (!subCheck.joined) {
+    const keyboard = buildForceSubKeyboard(subCheck.channels || []);
     return await tgCall('sendMessage', {
       chat_id: chatId,
       text: `${welcomeText}\n\n⚠️ *Please join our official channels to use this bot:*`,
       parse_mode: 'Markdown',
-      reply_markup: {
-        inline_keyboard: [
-          [
-            { text: CONFIG.FORCE_SUB_CHANNELS[0].name, url: CONFIG.FORCE_SUB_CHANNELS[0].url },
-            { text: CONFIG.FORCE_SUB_CHANNELS[1].name, url: CONFIG.FORCE_SUB_CHANNELS[1].url },
-          ],
-          [
-            { text: CONFIG.FORCE_SUB_CHANNELS[2].name, url: CONFIG.FORCE_SUB_CHANNELS[2].url },
-            { text: 'Updates 📢', url: CONFIG.UPDATE_CHANNEL_URL },
-          ],
-        ],
-      },
+      reply_markup: keyboard,
     });
   }
 
@@ -164,7 +440,8 @@ async function handleStartCommand(chatId, userId, firstName) {
  * Handle /gen command for Ads Token
  */
 async function handleGenCommand(chatId, userId, firstName) {
-  if (!CONFIG.USE_TOKEN_SYSTEM) {
+  const tokenEnabled = await isTokenSystemEnabled();
+  if (!tokenEnabled) {
     return await tgCall('sendMessage', {
       chat_id: chatId,
       text: '✅ The token system is currently *disabled*. You can send TeraBox links directly!',
@@ -266,28 +543,19 @@ async function handleTeraboxLink(chatId, userId, url, replyToId) {
   // 1. Force Sub Check
   const subCheck = await checkForceSub(userId);
   if (!subCheck.joined) {
+    const keyboard = buildForceSubKeyboard(subCheck.channels || []);
     return await tgCall('sendMessage', {
       chat_id: chatId,
       text: '⚠️ *You must join our channels before downloading!*\n\nPlease join the channels below and send the link again:',
       parse_mode: 'Markdown',
       reply_to_message_id: replyToId,
-      reply_markup: {
-        inline_keyboard: [
-          [
-            { text: CONFIG.FORCE_SUB_CHANNELS[0].name, url: CONFIG.FORCE_SUB_CHANNELS[0].url },
-            { text: CONFIG.FORCE_SUB_CHANNELS[1].name, url: CONFIG.FORCE_SUB_CHANNELS[1].url },
-          ],
-          [
-            { text: CONFIG.FORCE_SUB_CHANNELS[2].name, url: CONFIG.FORCE_SUB_CHANNELS[2].url },
-            { text: 'Updates 📢', url: CONFIG.UPDATE_CHANNEL_URL },
-          ],
-        ],
-      },
+      reply_markup: keyboard,
     });
   }
 
   // 2. Token system check
-  if (CONFIG.USE_TOKEN_SYSTEM && !CONFIG.ADMINS.includes(userId)) {
+  const tokenEnabled = await isTokenSystemEnabled();
+  if (tokenEnabled && !CONFIG.ADMINS.includes(userId)) {
     const active = await BotSession.findOne({
       user_id: userId,
       token_id: 'ACTIVE_WINDOW',
@@ -351,30 +619,31 @@ async function handleTeraboxLink(chatId, userId, url, replyToId) {
       const file = files[i];
       const fileName = file.name || 'TeraBox_File';
       const fileSize = file.size || 'Unknown';
-      const downloadLink = file.dlink || file.download_url;
-      const streamLink = file.stream_url || downloadLink;
+      const rawLink = file.dlink || file.download_url;
 
-      if (!downloadLink) {
+      if (!rawLink) {
         continue;
       }
 
-      const buttons = [];
+      // Route through download.php proxy to attach TeraBox headers and eliminate 403 sign errors
+      const b64Url = Buffer.from(rawLink).toString('base64');
+      const cookieVal = result?.downloadHeaders?.Cookie || '';
 
-      // Download Button
-      buttons.push([
-        { text: '⬇️ Direct Fast Download', url: downloadLink },
-      ]);
+      let downloadLink = `${CONFIG.DOWNLOAD_PROXY_URL}?url=${encodeURIComponent(b64Url)}&b64=1&filename=${encodeURIComponent(fileName)}`;
+      let streamLink = `${CONFIG.DOWNLOAD_PROXY_URL}?url=${encodeURIComponent(b64Url)}&b64=1&stream=1&filename=${encodeURIComponent(fileName)}`;
 
-      // Stream Button (if available)
-      if (streamLink) {
-        buttons.push([
-          { text: '▶️ Watch / Stream Online', url: streamLink },
-        ]);
+      if (cookieVal) {
+        downloadLink += `&cookie=${encodeURIComponent(cookieVal)}`;
+        streamLink += `&cookie=${encodeURIComponent(cookieVal)}`;
       }
+
+      const buttons = [
+        [{ text: '⬇️ Direct Fast Download', url: downloadLink }],
+        [{ text: '▶️ Watch / Stream Online', url: streamLink }],
+      ];
 
       const caption = `📁 *File Name:* \`${fileName}\`\n📦 *Size:* \`${fileSize}\`\n\n⚡ *Status:* \`Ready for Download & Stream\`\n_Click the buttons below to open directly in your browser or player:_`;
 
-      // If thumbnail is available, send as photo
       if (file.thumbnail && file.thumbnail.startsWith('http')) {
         await tgCall('sendPhoto', {
           chat_id: chatId,
@@ -393,7 +662,7 @@ async function handleTeraboxLink(chatId, userId, url, replyToId) {
       }
     }
 
-    // Delete or edit initial status message
+    // Delete initial status message
     if (statusMsgId) {
       await tgCall('deleteMessage', { chat_id: chatId, message_id: statusMsgId });
     }
@@ -411,12 +680,217 @@ async function handleTeraboxLink(chatId, userId, url, replyToId) {
 }
 
 /**
- * Handle Callback Query (if user clicks inline buttons)
+ * Handle Callback Query (Buttons)
  */
 async function handleCallback(cq) {
+  const cqId = cq.id;
+  const userId = cq.from.id;
+  const chatId = cq.message?.chat?.id;
+  const messageId = cq.message?.message_id;
+  const data = cq.data || '';
+  const isAdmin = CONFIG.ADMINS.includes(userId);
+
+  // Settings permission protection
+  if (
+    data.startsWith('settings_') ||
+    data.startsWith('del_ch_') ||
+    data.startsWith('toggle_') ||
+    data === 'close_settings' ||
+    data === 'test_forcesub'
+  ) {
+    if (!isAdmin) {
+      return await tgCall('answerCallbackQuery', {
+        callback_query_id: cqId,
+        text: '❌ You are not authorized to use admin settings!',
+        show_alert: true,
+      });
+    }
+  }
+
+  // 1. Close Settings Panel
+  if (data === 'close_settings') {
+    await tgCall('deleteMessage', { chat_id: chatId, message_id: messageId });
+    await AdminState.deleteOne({ user_id: userId });
+    return await tgCall('answerCallbackQuery', {
+      callback_query_id: cqId,
+      text: 'Settings closed.',
+    });
+  }
+
+  // 2. Add Channel
+  if (data === 'settings_add_channel') {
+    await AdminState.updateOne(
+      { user_id: userId },
+      { $set: { state: 'AWAITING_FORWARD', data: {}, updated_at: new Date() } },
+      { upsert: true }
+    );
+    await tgCall('answerCallbackQuery', { callback_query_id: cqId });
+    return await tgCall('editMessageText', {
+      chat_id: chatId,
+      message_id: messageId,
+      text: `📢 *Add Force Sub Channel*\n\n👉 *Please forward any message from the channel or group you want to add.*\n\n⚠️ *Important:* Make sure @${CONFIG.BOT_USERNAME || 'the bot'} is already an *Administrator* in that channel with "Invite Users" permission!\n\nSend /cancel to return to settings.`,
+      parse_mode: 'Markdown',
+      reply_markup: {
+        inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'settings_home' }]],
+      },
+    });
+  }
+
+  // 3. Settings Home
+  if (data === 'settings_home') {
+    await AdminState.deleteOne({ user_id: userId });
+    await tgCall('answerCallbackQuery', { callback_query_id: cqId });
+    const panel = await getSettingsPanelData();
+    return await tgCall('editMessageText', {
+      chat_id: chatId,
+      message_id: messageId,
+      text: panel.text,
+      parse_mode: 'Markdown',
+      disable_web_page_preview: true,
+      reply_markup: panel.reply_markup,
+    });
+  }
+
+  // 4. Delete Channel Menu
+  if (data === 'settings_del_menu') {
+    await tgCall('answerCallbackQuery', { callback_query_id: cqId });
+    const channels = await getActiveForceSubChannels();
+
+    if (!channels || channels.length === 0) {
+      return await tgCall('editMessageText', {
+        chat_id: chatId,
+        message_id: messageId,
+        text: '🗑️ *Delete Force Sub Channels*\n\n_No channels configured to delete._',
+        parse_mode: 'Markdown',
+        reply_markup: {
+          inline_keyboard: [[{ text: '⬅️ Back to Settings', callback_data: 'settings_home' }]],
+        },
+      });
+    }
+
+    const delButtons = channels.map((c) => [
+      { text: `❌ Delete: ${c.name} (${c.id})`, callback_data: `del_ch_${c.id}` },
+    ]);
+    delButtons.push([{ text: '⬅️ Back to Settings', callback_data: 'settings_home' }]);
+
+    return await tgCall('editMessageText', {
+      chat_id: chatId,
+      message_id: messageId,
+      text: '🗑️ *Delete Force Sub Channels*\n\nClick on any channel below to remove it from Force Sub:',
+      parse_mode: 'Markdown',
+      reply_markup: { inline_keyboard: delButtons },
+    });
+  }
+
+  // 5. Delete specific channel
+  if (data.startsWith('del_ch_')) {
+    const targetId = Number(data.replace('del_ch_', ''));
+    await ForceSubChannel.deleteOne({ chat_id: targetId });
+    await tgCall('answerCallbackQuery', {
+      callback_query_id: cqId,
+      text: `Channel ${targetId} removed successfully!`,
+      show_alert: true,
+    });
+
+    const channels = await getActiveForceSubChannels();
+    if (!channels || channels.length === 0) {
+      return await tgCall('editMessageText', {
+        chat_id: chatId,
+        message_id: messageId,
+        text: '🗑️ *Delete Force Sub Channels*\n\n_All channels removed._',
+        parse_mode: 'Markdown',
+        reply_markup: {
+          inline_keyboard: [[{ text: '⬅️ Back to Settings', callback_data: 'settings_home' }]],
+        },
+      });
+    }
+
+    const delButtons = channels.map((c) => [
+      { text: `❌ Delete: ${c.name} (${c.id})`, callback_data: `del_ch_${c.id}` },
+    ]);
+    delButtons.push([{ text: '⬅️ Back to Settings', callback_data: 'settings_home' }]);
+
+    return await tgCall('editMessageText', {
+      chat_id: chatId,
+      message_id: messageId,
+      text: '🗑️ *Delete Force Sub Channels*\n\nClick on any channel below to remove it from Force Sub:',
+      parse_mode: 'Markdown',
+      reply_markup: { inline_keyboard: delButtons },
+    });
+  }
+
+  // 6. Toggle Force Sub
+  if (data === 'toggle_forcesub') {
+    const current = await isForceSubEnabled();
+    const nextVal = !current;
+    await BotSetting.updateOne(
+      { key: 'FORCE_SUB_ENABLED' },
+      { $set: { key: 'FORCE_SUB_ENABLED', value: nextVal, updated_at: new Date() } },
+      { upsert: true }
+    );
+    await tgCall('answerCallbackQuery', {
+      callback_query_id: cqId,
+      text: `Force Subscription is now ${nextVal ? 'ENABLED ✅' : 'DISABLED ❌'}`,
+    });
+    const panel = await getSettingsPanelData();
+    return await tgCall('editMessageText', {
+      chat_id: chatId,
+      message_id: messageId,
+      text: panel.text,
+      parse_mode: 'Markdown',
+      disable_web_page_preview: true,
+      reply_markup: panel.reply_markup,
+    });
+  }
+
+  // 7. Toggle Token System
+  if (data === 'toggle_token') {
+    const current = await isTokenSystemEnabled();
+    const nextVal = !current;
+    await BotSetting.updateOne(
+      { key: 'USE_TOKEN_SYSTEM' },
+      { $set: { key: 'USE_TOKEN_SYSTEM', value: nextVal, updated_at: new Date() } },
+      { upsert: true }
+    );
+    await tgCall('answerCallbackQuery', {
+      callback_query_id: cqId,
+      text: `Token System is now ${nextVal ? 'ENABLED ✅' : 'DISABLED ❌'}`,
+    });
+    const panel = await getSettingsPanelData();
+    return await tgCall('editMessageText', {
+      chat_id: chatId,
+      message_id: messageId,
+      text: panel.text,
+      parse_mode: 'Markdown',
+      disable_web_page_preview: true,
+      reply_markup: panel.reply_markup,
+    });
+  }
+
+  // 8. Test Force Sub On Myself (Admin self-test)
+  if (data === 'test_forcesub') {
+    await tgCall('answerCallbackQuery', { callback_query_id: cqId, text: 'Testing force sub...' });
+    const subCheck = await checkForceSub(userId, true); // ignoreAdmin = true
+    if (subCheck.joined) {
+      return await tgCall('sendMessage', {
+        chat_id: chatId,
+        text: '✅ *Test Result:* You are a member or have requested to join all active channels! Regular users would be allowed to download.',
+        parse_mode: 'Markdown',
+      });
+    } else {
+      const keyboard = buildForceSubKeyboard(subCheck.channels || []);
+      return await tgCall('sendMessage', {
+        chat_id: chatId,
+        text: '🧪 *Test Result (What a normal user sees):*\n\n⚠️ *You must join our channels before downloading!*\n\nPlease join the channels below and send the link again:',
+        parse_mode: 'Markdown',
+        reply_markup: keyboard,
+      });
+    }
+  }
+
+  // Generic callback fallback
   await tgCall('answerCallbackQuery', {
-    callback_query_id: cq.id,
-    text: 'Redirecting to your link...',
+    callback_query_id: cqId,
+    text: 'Processing...',
   });
 }
-

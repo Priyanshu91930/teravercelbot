@@ -22,8 +22,44 @@ const BotSessionSchema = new mongoose.Schema({
   expires_at: { type: Date, index: { expires: 0 } }, // Auto-delete via MongoDB TTL
 });
 
+// Force Sub Channel Schema (Configurable dynamically by admins via /settings)
+const ForceSubChannelSchema = new mongoose.Schema({
+  chat_id: { type: Number, required: true, unique: true, index: true },
+  name: { type: String, default: 'Channel 📢' },
+  url: { type: String, required: true },
+  created_at: { type: Date, default: Date.now },
+});
+
+// Admin Conversation State Schema (For handling forwarded channel messages, etc.)
+const AdminStateSchema = new mongoose.Schema({
+  user_id: { type: Number, required: true, unique: true, index: true },
+  state: { type: String, required: true },
+  data: { type: mongoose.Schema.Types.Mixed, default: {} },
+  updated_at: { type: Date, default: Date.now, expires: 900 }, // 15 min TTL
+});
+
+// Dynamic Bot Setting Schema (For toggling Force Sub or Token System via /settings)
+const BotSettingSchema = new mongoose.Schema({
+  key: { type: String, required: true, unique: true, index: true },
+  value: { type: mongoose.Schema.Types.Mixed, required: true },
+  updated_at: { type: Date, default: Date.now },
+});
+
+// Join Request Schema (For private channel "Request to Join" verification)
+const JoinRequestSchema = new mongoose.Schema({
+  userId: { type: Number, required: true, index: true },
+  chatId: { type: Number, required: true, index: true },
+  status: { type: String, enum: ['pending', 'approved', 'declined'], default: 'pending' },
+  createdAt: { type: Date, default: Date.now },
+});
+JoinRequestSchema.index({ userId: 1, chatId: 1 }, { unique: true });
+
 export const BotUser = mongoose.models.BotUser || mongoose.model('BotUser', BotUserSchema);
 export const BotSession = mongoose.models.BotSession || mongoose.model('BotSession', BotSessionSchema);
+export const ForceSubChannel = mongoose.models.ForceSubChannel || mongoose.model('ForceSubChannel', ForceSubChannelSchema);
+export const AdminState = mongoose.models.AdminState || mongoose.model('AdminState', AdminStateSchema);
+export const BotSetting = mongoose.models.BotSetting || mongoose.model('BotSetting', BotSettingSchema);
+export const JoinRequest = mongoose.models.JoinRequest || mongoose.model('JoinRequest', JoinRequestSchema);
 
 export async function connectMongo() {
   if (isConnected || mongoose.connection.readyState === 1) {

@@ -1,12 +1,13 @@
 import { CONFIG } from './config.js';
 import crypto from 'node:crypto';
+import { ForceSubChannel, BotSetting, JoinRequest } from './db.js';
 
 const TELEGRAM_API = `https://api.telegram.org/bot${CONFIG.BOT_TOKEN}`;
 
 /**
  * Call Telegram Bot API
  */
-export async function tgCall(method, payload) {
+export async function tgCall(method, payload = {}) {
   try {
     const res = await fetch(`${TELEGRAM_API}/${method}`, {
       method: 'POST',
@@ -56,7 +57,72 @@ export function extractTeraboxUrl(text) {
 }
 
 /**
+ * Check if dynamic Force Sub is enabled (MongoDB setting overrides .env)
+ */
+export async function isForceSubEnabled() {
+  try {
+    const setting = await BotSetting.findOne({ key: 'FORCE_SUB_ENABLED' });
+    if (setting && typeof setting.value === 'boolean') {
+      return setting.value;
+    }
+  } catch (e) {
+    console.error('[Settings] Error checking FORCE_SUB_ENABLED:', e.message);
+  }
+  return CONFIG.FORCE_SUB_ENABLED;
+}
+
+/**
+ * Check if dynamic Token System is enabled (MongoDB setting overrides .env)
+ */
+export async function isTokenSystemEnabled() {
+  try {
+    const setting = await BotSetting.findOne({ key: 'USE_TOKEN_SYSTEM' });
+    if (setting && typeof setting.value === 'boolean') {
+      return setting.value;
+    }
+  } catch (e) {
+    console.error('[Settings] Error checking USE_TOKEN_SYSTEM:', e.message);
+  }
+  return CONFIG.USE_TOKEN_SYSTEM;
+}
+
+/**
+ * Retrieve active Force Sub channels from MongoDB (with auto-seeding if empty)
+ */
+export async function getActiveForceSubChannels() {
+  try {
+    let dbChannels = await ForceSubChannel.find({}).sort({ created_at: 1 });
+    if (!dbChannels || dbChannels.length === 0) {
+      // Auto-seed initial default channels from config into MongoDB
+      if (CONFIG.FORCE_SUB_CHANNELS && CONFIG.FORCE_SUB_CHANNELS.length > 0) {
+        for (const ch of CONFIG.FORCE_SUB_CHANNELS) {
+          await ForceSubChannel.updateOne(
+            { chat_id: ch.id },
+            { $set: { chat_id: ch.id, name: ch.name, url: ch.url, created_at: new Date() } },
+            { upsert: true }
+          );
+        }
+        dbChannels = await ForceSubChannel.find({}).sort({ created_at: 1 });
+      }
+    }
+
+    if (dbChannels && dbChannels.length > 0) {
+      return dbChannels.map((c) => ({
+        id: Number(c.chat_id),
+        name: c.name,
+        url: c.url,
+      }));
+    }
+  } catch (e) {
+    console.error('[ForceSub] Error loading channels from DB:', e.message);
+  }
+
+  return CONFIG.FORCE_SUB_CHANNELS || [];
+}
+
+/**
  * Check if user is member of a specific Telegram chat/channel
+ * Supports both direct membership and pending Join Requests (for private links)
  */
 export async function isUserInChat(chatId, userId) {
   try {
@@ -66,31 +132,80 @@ export async function isUserInChat(chatId, userId) {
     });
     if (res.ok && res.result) {
       const status = res.result.status;
-      return ['creator', 'administrator', 'member', 'restricted'].includes(status);
+      if (['creator', 'administrator', 'member', 'restricted'].includes(status)) {
+        return true;
+      }
     }
-    return false;
   } catch (err) {
-    console.error(`[ForceSub] Error checking chat ${chatId}:`, err.message);
-    return false;
+    console.error(`[ForceSub] getChatMember error chat ${chatId}:`, err.message);
   }
+
+  // Check pending join request in MongoDB (for private channels with Request to Join)
+  try {
+    const req = await JoinRequest.findOne({
+      userId: Number(userId),
+      chatId: Number(chatId),
+      status: 'pending',
+    });
+    if (req) {
+      return true;
+    }
+  } catch (err) {
+    console.error('[ForceSub] JoinRequest check error:', err.message);
+  }
+
+  return false;
 }
 
 /**
- * Check all force subscribe channels
+ * Check all force subscribe channels for a user
+ * @param {number} userId - Telegram user ID
+ * @param {boolean} ignoreAdmin - Pass true when admin tests on self
  */
-export async function checkForceSub(userId) {
-  if (!CONFIG.FORCE_SUB_ENABLED || CONFIG.ADMINS.includes(userId)) {
+export async function checkForceSub(userId, ignoreAdmin = false) {
+  const enabled = await isForceSubEnabled();
+  if (!enabled || (!ignoreAdmin && CONFIG.ADMINS.includes(userId))) {
     return { joined: true };
   }
 
-  for (const ch of CONFIG.FORCE_SUB_CHANNELS) {
+  const channels = await getActiveForceSubChannels();
+  if (!channels || channels.length === 0) {
+    return { joined: true, channels: [] };
+  }
+
+  const missing = [];
+  for (const ch of channels) {
     const ok = await isUserInChat(ch.id, userId);
     if (!ok) {
-      return { joined: false, missing: ch };
+      missing.push(ch);
     }
   }
 
-  return { joined: true };
+  if (missing.length > 0) {
+    return { joined: false, missing, channels };
+  }
+
+  return { joined: true, channels };
+}
+
+/**
+ * Build inline keyboard for Force Sub channels dynamically
+ */
+export function buildForceSubKeyboard(channels = []) {
+  const keyboard = [];
+  for (let i = 0; i < channels.length; i += 2) {
+    const row = [
+      { text: channels[i].name || `Channel ${i + 1} 📢`, url: channels[i].url },
+    ];
+    if (channels[i + 1]) {
+      row.push({ text: channels[i + 1].name || `Channel ${i + 2} 📢`, url: channels[i + 1].url });
+    }
+    keyboard.push(row);
+  }
+  if (CONFIG.UPDATE_CHANNEL_URL) {
+    keyboard.push([{ text: 'Updates Channel 📢', url: CONFIG.UPDATE_CHANNEL_URL }]);
+  }
+  return { inline_keyboard: keyboard };
 }
 
 /**
@@ -127,4 +242,3 @@ export async function generateShortlink(userId) {
 
   return { uid, url: targetUrl };
 }
-
