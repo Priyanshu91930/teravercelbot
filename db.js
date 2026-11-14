@@ -9,6 +9,10 @@ const BotUserSchema = new mongoose.Schema(
     user_id: { type: Number, required: true, unique: true, index: true },
     first_name: { type: String, default: '' },
     username: { type: String, default: '' },
+    is_app_user: { type: Boolean, default: false }, // true if user came from Android Mobile App
+    app_linked_at: { type: Date },
+    daily_count: { type: Number, default: 0 },
+    last_usage_date: { type: String, default: '' }, // YYYY-MM-DD (UTC date string)
     updated_at: { type: Date, default: Date.now },
   },
   { timestamps: { createdAt: 'created_at', updatedAt: 'updated_at' } }

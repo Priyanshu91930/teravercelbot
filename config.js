@@ -46,4 +46,9 @@ export const CONFIG = {
 
   // Database (from env)
   MONGODB_URI: process.env.MONGODB_URI || "",
+
+  // User Limits & App Integration
+  DAILY_LIMIT: Number(process.env.DAILY_LIMIT || "5"),
+  APP_PLAYSTORE_URL: process.env.APP_PLAYSTORE_URL || "https://play.google.com/store/apps/details?id=com.anihub.teradownloader",
+  WEBSITE_URL: process.env.WEBSITE_URL || "https://teraboxdownloader.co.in/",
 };

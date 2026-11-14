@@ -20,6 +20,9 @@ import {
   getDumpChannelId,
   sendToDumpChannel,
   buildForceSubKeyboard,
+  checkUserLimit,
+  incrementUserUsage,
+  markUserAsAppUser,
 } from '../telegram.js';
 
 export const config = {
@@ -218,6 +221,35 @@ async function handleMessage(m) {
     const parts = text.split(' ');
     const arg = parts[1] || '';
 
+    // Check if user came from Android Mobile App: /start app_<shortcode> or /start app
+    if (arg.startsWith('app_') || arg === 'app') {
+      await markUserAsAppUser(userId);
+
+      const shortcode = arg.replace(/^app_?/, '').trim();
+      if (shortcode && shortcode !== 'user' && shortcode !== 'link') {
+        let targetUrl = shortcode;
+        if (!targetUrl.startsWith('http')) {
+          targetUrl = `https://1024terabox.com/s/${shortcode}`;
+        }
+        await tgCall('sendMessage', {
+          chat_id: chatId,
+          text: '📱 *Verified as Android App User!*\n✨ You have *UNLIMITED Downloads* (no daily limits).\n\n🔍 *Fetching file details from TeraBox...*',
+          parse_mode: 'Markdown',
+        });
+        return await handleTeraboxLink(chatId, userId, targetUrl, m.message_id, { username, firstName });
+      }
+
+      return await tgCall('sendMessage', {
+        chat_id: chatId,
+        text:
+          `📱 *Welcome to TeraBox Downloader!*\n\n` +
+          `✨ *Android App User Verified!*\n` +
+          `Your account has been granted *UNLIMITED downloads* with NO daily limits.\n\n` +
+          `Send any TeraBox link anytime to get direct download and stream links! 🚀`,
+        parse_mode: 'Markdown',
+      });
+    }
+
     // Check if token activation via /start token_UUID
     if (arg.startsWith('token_')) {
       const tokenId = arg.replace('token_', '').trim();
@@ -235,9 +267,14 @@ async function handleMessage(m) {
 
   // Command: /id
   if (text === '/id') {
+    const u = await BotUser.findOne({ user_id: userId });
+    const isApp = u?.is_app_user || false;
+    const todayStr = new Date().toISOString().slice(0, 10);
+    const count = (u?.last_usage_date === todayStr) ? (u?.daily_count || 0) : 0;
+    const statusText = isApp ? '📱 Android App User (Unlimited ✨)' : `Regular User (${count}/${CONFIG.DAILY_LIMIT} used today)`;
     return await tgCall('sendMessage', {
       chat_id: chatId,
-      text: `Your Chat ID: \`${chatId}\`\nYour User ID: \`${userId}\``,
+      text: `• *Your Chat ID:* \`${chatId}\`\n• *Your User ID:* \`${userId}\`\n• *Account Status:* *${statusText}*`,
       parse_mode: 'Markdown',
     });
   }
@@ -246,6 +283,7 @@ async function handleMessage(m) {
   if (text === '/stats') {
     if (isAdmin) {
       const userCount = await BotUser.countDocuments();
+      const appUserCount = await BotUser.countDocuments({ is_app_user: true });
       const activeSessions = await BotSession.countDocuments({
         token_id: 'ACTIVE_WINDOW',
         expires_at: { $gt: new Date() },
@@ -253,7 +291,7 @@ async function handleMessage(m) {
       const channelCount = (await getActiveForceSubChannels()).length;
       return await tgCall('sendMessage', {
         chat_id: chatId,
-        text: `📊 *Bot Statistics (Vercel Serverless)*\n\n• *Total Users:* \`${userCount}\`\n• *Active Token Sessions:* \`${activeSessions}\`\n• *Force Sub Channels:* \`${channelCount}\`\n• *API Base:* \`${CONFIG.TERABOX_API_BASE}\``,
+        text: `📊 *Bot Statistics (Vercel Serverless)*\n\n• *Total Users:* \`${userCount}\`\n• *Android App Users (Unlimited):* \`${appUserCount}\`\n• *Regular Users:* \`${userCount - appUserCount}\`\n• *Active Token Sessions:* \`${activeSessions}\`\n• *Force Sub Channels:* \`${channelCount}\`\n• *Daily Limit:* \`${CONFIG.DAILY_LIMIT} links/day\`\n• *API Base:* \`${CONFIG.TERABOX_API_BASE}\``,
         parse_mode: 'Markdown',
       });
     }
@@ -576,7 +614,19 @@ async function getSettingsPanelData() {
 async function handleStartCommand(chatId, userId, firstName) {
   const subCheck = await checkForceSub(userId);
 
-  const welcomeText = `👋 *Hello ${firstName || 'Friend'}!*\n\nI am your *TeraBox Direct Downloader Bot* powered by fast serverless cloud!\n\nJust send me any *TeraBox link* and I will instantly give you:\n• ⬇️ *Direct High-Speed Download Link*\n• ▶️ *Direct Online Streaming Link*\n\n_No VPS delay, zero wait time!_ 🚀`;
+  const user = await BotUser.findOne({ user_id: userId });
+  const isAppUser = user?.is_app_user || false;
+  const statusLine = isAppUser
+    ? '📱 *Status:* `Android App User (Unlimited Downloads ✨)`'
+    : `📊 *Daily Quota:* \`${CONFIG.DAILY_LIMIT} free downloads per day\`\n💡 _Get unlimited downloads by installing our Android app!_`;
+
+  const welcomeText =
+    `👋 *Hello ${firstName || 'Friend'}!*\n\n` +
+    `I am your *TeraBox Direct Downloader Bot* powered by fast serverless cloud!\n\n` +
+    `• ⬇️ *Direct High-Speed Download Link*\n` +
+    `• ▶️ *Direct Online Streaming Link*\n\n` +
+    `${statusLine}\n\n` +
+    `_No VPS delay, zero wait time!_ 🚀`;
 
   if (!subCheck.joined) {
     const keyboard = buildForceSubKeyboard(subCheck.channels || []);
@@ -588,10 +638,16 @@ async function handleStartCommand(chatId, userId, firstName) {
     });
   }
 
+  const extraButtons = [];
+  if (!isAppUser) {
+    extraButtons.push([{ text: '📲 Download Android App (Unlimited)', url: CONFIG.APP_PLAYSTORE_URL }]);
+  }
+
   return await tgCall('sendMessage', {
     chat_id: chatId,
     text: welcomeText,
     parse_mode: 'Markdown',
+    reply_markup: extraButtons.length > 0 ? { inline_keyboard: extraButtons } : undefined,
   });
 }
 
@@ -730,7 +786,30 @@ async function handleTeraboxLink(chatId, userId, url, replyToId, userInfo = {}) 
     }
   }
 
-  // 3. Send "Searching / Fetching" message
+  // 3. Daily Download Limit Check (5 links/day for regular Telegram users; Unlimited for App users & Admins)
+  const limitCheck = await checkUserLimit(userId);
+  if (!limitCheck.allowed) {
+    const limitKeyboard = {
+      inline_keyboard: [
+        [{ text: '📲 Download Android App (Unlimited Access)', url: CONFIG.APP_PLAYSTORE_URL }],
+        [{ text: '🌐 Visit Website', url: CONFIG.WEBSITE_URL }],
+      ],
+    };
+    return await tgCall('sendMessage', {
+      chat_id: chatId,
+      text:
+        `⚠️ *Daily Limit Reached (5/5 Links Used Today)*\n\n` +
+        `Regular Telegram users get *5 free downloads per day*.\n` +
+        `Your daily quota will reset tomorrow at midnight UTC.\n\n` +
+        `🚀 *Want UNLIMITED Downloads with No Limits?*\n` +
+        `Install our official *TeraBox Downloader Android App*! Mobile app users enjoy *100% UNLIMITED* downloads with zero restrictions.`,
+      parse_mode: 'Markdown',
+      reply_to_message_id: replyToId,
+      reply_markup: limitKeyboard,
+    });
+  }
+
+  // 4. Send "Searching / Fetching" message
   const statusRes = await tgCall('sendMessage', {
     chat_id: chatId,
     text: '🔍 *Fetching file details from TeraBox servers...*',
@@ -801,7 +880,17 @@ async function handleTeraboxLink(chatId, userId, url, replyToId, userInfo = {}) 
         [{ text: '▶️ Watch / Stream Online', url: streamLink }],
       ];
 
-      const caption = `📁 *File Name:* \`${fileName}\`\n📦 *Size:* \`${fileSize}\`\n\n⚡ *Status:* \`Ready for Download & Stream\`\n_Click the buttons below to open directly in your browser or player:_`;
+      if (!limitCheck.isAppUser) {
+        buttons.push([{ text: '📲 Get Unlimited Access (Android App)', url: CONFIG.APP_PLAYSTORE_URL }]);
+      }
+
+      // Increment daily usage count for user
+      const newCount = await incrementUserUsage(userId);
+      const statusNote = limitCheck.isAppUser
+        ? '✨ `Android App User (Unlimited Access)`'
+        : `📊 \`${newCount}/${CONFIG.DAILY_LIMIT} free links used today\``;
+
+      const caption = `📁 *File Name:* \`${fileName}\`\n📦 *Size:* \`${fileSize}\`\n⚡ *Status:* \`Ready for Download & Stream\`\n• ${statusNote}\n\n_Click the buttons below to open directly in your browser or player:_`;
 
       if (file.thumbnail && file.thumbnail.startsWith('http')) {
         await tgCall('sendPhoto', {

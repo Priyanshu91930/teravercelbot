@@ -1,6 +1,6 @@
 import { CONFIG } from './config.js';
 import crypto from 'node:crypto';
-import { ForceSubChannel, BotSetting, JoinRequest } from './db.js';
+import { BotUser, ForceSubChannel, BotSetting, JoinRequest } from './db.js';
 
 const TELEGRAM_API = `https://api.telegram.org/bot${CONFIG.BOT_TOKEN}`;
 
@@ -331,4 +331,85 @@ export async function generateShortlink(userId) {
   }
 
   return { uid, url: targetUrl };
+}
+
+/**
+ * Check if a user is within daily link limit or is an unlimited Android App user / Admin
+ */
+export async function checkUserLimit(userId) {
+  const numUserId = Number(userId);
+
+  // Admins always have unlimited downloads
+  if (CONFIG.ADMINS.includes(numUserId)) {
+    return { allowed: true, isAppUser: true, isAdmin: true, remaining: Infinity };
+  }
+
+  try {
+    const user = await BotUser.findOne({ user_id: numUserId });
+
+    // App users have 100% UNLIMITED downloads
+    if (user && user.is_app_user) {
+      return { allowed: true, isAppUser: true, isAdmin: false, remaining: Infinity };
+    }
+
+    const todayStr = new Date().toISOString().slice(0, 10);
+    const count = (user && user.last_usage_date === todayStr) ? (user.daily_count || 0) : 0;
+    const limit = CONFIG.DAILY_LIMIT || 5;
+
+    if (count >= limit) {
+      return { allowed: false, isAppUser: false, count, limit, remaining: 0 };
+    }
+
+    return { allowed: true, isAppUser: false, count, limit, remaining: limit - count };
+  } catch (e) {
+    console.error('[Limit] Error checking user limit:', e.message);
+    return { allowed: true, isAppUser: false, remaining: 1 };
+  }
+}
+
+/**
+ * Increment daily usage for a user
+ */
+export async function incrementUserUsage(userId) {
+  const numUserId = Number(userId);
+  const todayStr = new Date().toISOString().slice(0, 10);
+
+  try {
+    const user = await BotUser.findOne({ user_id: numUserId });
+    if (user && user.last_usage_date === todayStr) {
+      const newCount = (user.daily_count || 0) + 1;
+      await BotUser.updateOne(
+        { user_id: numUserId },
+        { $set: { daily_count: newCount, updated_at: new Date() } }
+      );
+      return newCount;
+    } else {
+      await BotUser.updateOne(
+        { user_id: numUserId },
+        { $set: { daily_count: 1, last_usage_date: todayStr, updated_at: new Date() } },
+        { upsert: true }
+      );
+      return 1;
+    }
+  } catch (e) {
+    console.error('[Limit] Error incrementing usage:', e.message);
+    return 1;
+  }
+}
+
+/**
+ * Mark user as an Android Mobile App user (Unlimited status)
+ */
+export async function markUserAsAppUser(userId) {
+  const numUserId = Number(userId);
+  try {
+    await BotUser.updateOne(
+      { user_id: numUserId },
+      { $set: { is_app_user: true, app_linked_at: new Date(), updated_at: new Date() } },
+      { upsert: true }
+    );
+    console.log(`[AppUser] User ${numUserId} verified as Android App User (Unlimited status)`);
+  } catch (e) {
+    console.error('[AppUser] Error saving app user:', e.message);
+  }
 }
